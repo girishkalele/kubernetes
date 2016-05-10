@@ -41,7 +41,7 @@ items:
       spec:
         containers:
         - name: netperf-orch
-          image: us.gcr.io/google.com/gkalele-netperf/netperf/latest
+          image: girishkalele/netperf-latest
           imagePullPolicy: Always
           ports:
           - containerPort: 5202
