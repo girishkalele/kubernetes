@@ -12,53 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-all: docker nptests push docker-client
-
-# Unfortunately, we need to build two Docker containers - one with no ports exposed
-# otherwise net=host mode cannot colocate W1 and W2 pods on the same node as needed
-# for testing within node network performance
+all: docker nptests push launch runtests
 
 DOCKERREPO       := girishkalele/netperf-latest
-DOCKERCLIENTREPO := girishkalele/netperf-client-latest
 
-docker: nptests
+docker: nptests launch
 	mkdir -p Dockerbuild && \
 	cp -f Dockerfile Dockerbuild/ && \
-	cp -f nptests Dockerbuild/ &&\
-	docker build -t $(DOCKERCLIENTREPO) Dockerbuild/ 
+	cp -f nptest/nptests Dockerbuild/ &&\
+	docker build -t $(DOCKERREPO) Dockerbuild/ 
 
-docker-client: nptests docker
-	mkdir -p Dockerbuildclient && \
-	cp -f Dockerfile-client Dockerbuildclient/Dockerfile && \
-	cp -f nptests Dockerbuildclient/ &&\
-	docker build -t $(DOCKERREPO) Dockerbuildclient/ 
-
-push: docker docker-client
-	gcloud docker push $(DOCKERCLIENTREPO)
+push: docker
 	gcloud docker push $(DOCKERREPO)
 
-authorize_gcloud:
-	gcloud docker --authorize-only
-
-authorize:
-	docker login
-
-nptests: nptest.go
-	go build -o nptests
+nptests: nptest/nptest.go
+	cd nptest; make nptests
 
 clean:
 	@rm -f Dockerbuild/*
-	@rm -f Dockerbuildclient/*
-	@rm -f ./nptests ./*svg ./*png ./*jpg ./*csv ./*.cap ./*.pyc nptests
+	@rm -f ./nptests ./*svg ./*png ./*jpg ./*csv ./*.cap ./*.pyc nptests ./*~
 	@go clean
+	cd nptest; make clean
 
-# The list of Python library packages need by the launch script
-PYTHON-DEP_LIBS := python-jinja2 python-matplotlib
+launch: launch.go
+	go build -o launch launch.go
 
-installdeps:
-	sudo apt-get install $(PYTHON_DEP_LIBS)
-
-runtests:
+# 'runtests' is the test runner target
+runtests: launch push
 	@echo Launching network performance tests
-	./launch.py
+	./launch
 

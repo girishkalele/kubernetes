@@ -7,7 +7,7 @@ A standardized benchmark to measure Kubernetes networking performance on multipl
 
 The benchmark can be executed via a single Python script invocation that triggers all the automated testing located in the orchestrator and worker pods as seen below. The test uses a custom docker container that has the go binary and iperf3 and other tools built into it. 
 The orchestrator pod coordinates the worker pods to run tests in serial order for the 4 scenarios described below, at MTUs (MSS tuning for TCP and direct packet size tuning for UDP).
-Using node labels, the Worker Pods 1 and 2 are placed on the same Kubernetes node, and Worker Pod 3 is placed on a different node. The nodes all communicate with the orchestrator pod service using simple golang rpcs and request work items.
+Using node labels, the Worker Pods 1 and 2 are placed on the same Kubernetes node, and Worker Pod 3 is placed on a different node. The nodes all communicate with the orchestrator pod service using simple golang rpcs and request work items. A minimum of two Kubernetes worker nodes are necessary for this test.
 
 ![](images/BenchmarkingKubernetesNetworkingPerformance.svg)
 
@@ -36,9 +36,11 @@ The iperf output (both TPC and UDP modes) and the netperf TCP output from all wo
 The launch script then extracts the netperf.csv file and writes it to local disk. All units in the csv file are in Gbits/second.
 All Kubernetes entities are created under the “netperf” namespace.
 
+Testcases can be added by extending the TestCase list in nptest/nptest.go
+
 ## Output Raw CSV data
 
-```bashscript
+```console
 MSS                                          , Maximum, 96, 352, 608, 864, 1120, 1376,
 1 iperf TCP. Same VM using Pod IP            ,35507.000000,33835,33430,35372,35220,35373,35507,
 2 iperf TCP. Same VM using Virtual IP        ,32997.000000,32689,32997,32256,31995,31904,31830,
