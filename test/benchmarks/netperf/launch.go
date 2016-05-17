@@ -343,7 +343,7 @@ func getCsvResultsFromPod(c *client.Client, podName string) *string {
 	if index == -1 || endIndex == -1 {
 		return nil
 	}
-	csvData := string(body[index:endIndex])
+	csvData := string(body[index+len(csvDataMarker)+1 : endIndex])
 	return &csvData
 }
 
