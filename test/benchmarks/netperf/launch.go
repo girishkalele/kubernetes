@@ -111,23 +111,14 @@ func setupClient() *client.Client {
 	return c
 }
 
-// getMinions : Only return minion nodes
+// getMinions : Only return schedulable/worker nodes
 func getMinionNodes(c *client.Client) *api.NodeList {
-	var nodesTmp *api.NodeList
-	var nodes api.NodeList
-	var err error
-	if nodesTmp, err = c.Nodes().List(everythingSelector); err != nil {
+	nodes, err := c.Nodes().List(api.ListOptions{FieldSelector: fields.Set{"spec.unschedulable": "false"}.AsSelector()})
+	if err != nil {
 		fmt.Println("Failed to fetch nodes", err)
 		return nil
 	}
-
-	for _, n := range nodesTmp.Items {
-		if strings.Contains(n.GetName(), "-minion") {
-			nodes.Items = append(nodes.Items, n)
-		}
-	}
-
-	return &nodes
+	return nodes
 }
 
 func cleanup(c *client.Client) {
@@ -150,8 +141,7 @@ func cleanup(c *client.Client) {
 	}
 	for _, pod := range pods.Items {
 		fmt.Println("Deleting pod", pod.GetName())
-		var gracePeriodZero int64
-		if err := c.Pods(testNamespace).Delete(pod.GetName(), &api.DeleteOptions{GracePeriodSeconds: &gracePeriodZero}); err != nil {
+		if err := c.Pods(testNamespace).Delete(pod.GetName(), &api.DeleteOptions{GracePeriodSeconds: new(int64)}); err != nil {
 			fmt.Println("Failed to delete pod", pod.GetName(), err)
 		}
 	}
@@ -164,7 +154,6 @@ func cleanup(c *client.Client) {
 		fmt.Println("Deleting svc", svc.GetName())
 		c.Services(testNamespace).Delete(svc.GetName())
 	}
-	time.Sleep(10 * time.Second)
 }
 
 // createServices: Long-winded function to programmatically create our two services
@@ -247,7 +236,9 @@ func createRCs(c *client.Client) bool {
 			Replicas: 1,
 			Selector: map[string]string{"app": name},
 			Template: &api.PodTemplateSpec{
-				ObjectMeta: api.ObjectMeta{Labels: map[string]string{"app": name}},
+				ObjectMeta: api.ObjectMeta{
+					Labels: map[string]string{"app": name},
+				},
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{
@@ -258,6 +249,7 @@ func createRCs(c *client.Client) bool {
 							ImagePullPolicy: "Always",
 						},
 					},
+					TerminationGracePeriodSeconds: new(int64),
 				},
 			},
 		},
@@ -307,7 +299,8 @@ func createRCs(c *client.Client) bool {
 								ImagePullPolicy: "Always",
 							},
 						},
-						SecurityContext: &api.PodSecurityContext{HostNetwork: hostnetworking},
+						SecurityContext:               &api.PodSecurityContext{HostNetwork: hostnetworking},
+						TerminationGracePeriodSeconds: new(int64),
 					},
 				},
 			},
@@ -374,15 +367,21 @@ func executeTests(c *client.Client) bool {
 			return false
 		}
 		fmt.Println("Waiting for netperf pods to start up")
-		time.Sleep(60 * time.Second)
-		var pods *api.PodList
-		var err error
-		if pods, err = c.Pods(testNamespace).List(everythingSelector); err != nil {
-			fmt.Println("Failed to fetch pods - test aborted", err)
-			return false
+
+		var orchestratorPodName string
+		for len(orchestratorPodName) == 0 {
+			fmt.Println("Waiting for orchestrator pod creation")
+			time.Sleep(60 * time.Second)
+			var pods *api.PodList
+			var err error
+			if pods, err = c.Pods(testNamespace).List(everythingSelector); err != nil {
+				fmt.Println("Failed to fetch pods - waiting for pod creation", err)
+				continue
+			}
+			orchestratorPodName = getOrchestratorPodName(pods)
 		}
-		orchestratorPodName := getOrchestratorPodName(pods)
 		fmt.Println("Orchestrator Pod is", orchestratorPodName)
+
 		// The pods orchestrate themselves, we just wait for the results file to show up in the orchestrator container
 		for true {
 			// Monitor the orchestrator pod for the CSV results file
@@ -390,10 +389,10 @@ func executeTests(c *client.Client) bool {
 			if csvdata == nil {
 				fmt.Println("Scanned orchestrator pod filesystem - no results file found yet...waiting for orchestrator to write CSV file...")
 				time.Sleep(60 * time.Second)
-			} else {
-				if processCsvData(csvdata) {
-					break
-				}
+				continue
+			}
+			if processCsvData(csvdata) {
+				break
 			}
 		}
 		fmt.Printf("TEST RUN (Iteration %d) FINISHED - cleaning up services and pods\n", i)
