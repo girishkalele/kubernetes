@@ -33,9 +33,13 @@ clean:
 	@rm -f ./nptests ./*svg ./*png ./*jpg ./*csv ./*.cap ./*.pyc nptests ./*~
 	@go clean
 	cd nptest; make clean
+	cd plotperf; make clean
 
-launch: launch.go
+launch: launch.go plotperf.bin
 	go build -o launch launch.go
+
+plotperf.bin: plotperf/plotperf.go
+	cd plotperf; make && cp plotperf.bin ../
 
 # 'runtests' is the test runner target
 runtests: launch push
