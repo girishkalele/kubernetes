@@ -41,4 +41,11 @@ launch: launch.go
 runtests: launch push
 	@echo Launching network performance tests
 	./launch
+	@echo Network performance tests complete - running matplotlib to generate graphs
+	cp netperf-latest.csv plotperf && cd plotperf; make plot && mv *png .. && mv *svg ..
+
+runtests-test:
+	@echo Launching network performance tests
+	@echo Network performance tests complete - running matplotlib to generate graphs
+	cp netperf-latest.csv plotperf && cd plotperf; make plot && mv *png .. && mv *svg ..
 
