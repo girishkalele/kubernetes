@@ -79,7 +79,7 @@ spec:
           name: dns-tcp-local
           protocol: TCP
       - name: dnsmasq
-        image: gcr.io/google_containers/dnsmasq-ARCH:1.1
+        image: gcr.io/google_containers/kube-dnsmasq-ARCH:1.2
         args:
         - --cache-size=1000
         - --no-resolv
