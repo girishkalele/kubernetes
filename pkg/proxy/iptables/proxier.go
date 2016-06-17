@@ -72,6 +72,8 @@ const KubeMarkMasqChain utiliptables.Chain = "KUBE-MARK-MASQ"
 // TODO(thockin): Remove this for v1.3 or v1.4.
 const oldIptablesMasqueradeMark = "0x4d415351"
 
+const reflectorInterfaceIp = "169.254.169.170"
+
 // IptablesVersioner can query the current iptables version.
 type IptablesVersioner interface {
 	// returns "X.Y.Z"
@@ -970,13 +972,16 @@ func (proxier *Proxier) syncProxyRules() {
 				"-m", "comment", "--comment", svcName.String(),
 			}
 			// Handle traffic that loops back to the originator with SNAT.
+			// DNAT to the laundry reflector interface's far IP.
 			// Technically we only need to do this if the endpoint is on this
 			// host, but we don't have that information, so we just do this for
 			// all endpoints.
 			// TODO: if we grow logic to get this node's pod CIDR, we can use it.
 			writeLine(natRules, append(args,
 				"-s", fmt.Sprintf("%s/32", strings.Split(endpoints[i], ":")[0]),
-				"-j", string(KubeMarkMasqChain))...)
+				"-p", "tcp",
+				"-m", "tcp",
+				"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", reflectorInterfaceIp, svcInfo.port))...)
 
 			// Update client-affinity lists.
 			if svcInfo.sessionAffinityType == api.ServiceAffinityClientIP {
