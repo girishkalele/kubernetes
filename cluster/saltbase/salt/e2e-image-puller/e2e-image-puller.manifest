@@ -46,7 +46,9 @@ spec:
     command:
     - /bin/sh
     - -c
-    - "/usr/bin/nethealth || true"
+    - "/usr/bin/nethealth.sh || true"
+    securityContext:
+      privileged: true
   volumes:
   - hostPath:
       path: /var/run/docker.sock
