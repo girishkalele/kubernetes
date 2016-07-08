@@ -75,6 +75,9 @@ type kubenetNetworkPlugin struct {
 	// kubenet will search for cni binaries in DefaultCNIDir first, then continue to vendorDir.
 	vendorDir         string
 	nonMasqueradeCIDR string
+
+	gateway         string
+	podcidr         string
 }
 
 func NewPlugin(networkPluginDir string) network.NetworkPlugin {
@@ -231,6 +234,8 @@ func (plugin *kubenetNetworkPlugin) Event(name string, details map[string]interf
 			// plugin will bail out if the bridge has an unexpected one
 			plugin.clearBridgeAddressesExcept(cidr)
 		}
+		plugin.gateway = cidr.IP.String()
+		plugin.podcidr = podCIDR
 	}
 
 	if err != nil {
@@ -325,6 +330,38 @@ func (plugin *kubenetNetworkPlugin) setup(namespace string, name string, id kube
 			if err != nil {
 				return fmt.Errorf("Error setting promiscuous mode on %s: %v", BridgeName, err)
 			}
+		}
+
+		output, err = plugin.execer.Command("ifconfig", BridgeName).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("Failed to retrieve mac address of %q: %v", BridgeName, err)
+		}
+		lines := strings.Split(string(output), "\n")
+		if len(lines) <= 0 {
+			return fmt.Errorf("Unexpected output: %v", output)
+		}
+		fields := strings.Fields(lines[0])
+		if len(fields) < 5 {
+			return fmt.Errorf("Unexpected output: %v", fields)
+		}
+		macAddr := fields[4]
+
+		glog.Infof("Filtering packets with ebtables on mac address: %v, gateway: %v, pod CIDR: %v", macAddr, plugin.gateway, plugin.podcidr)
+		ebtablePath, err := plugin.execer.LookPath("ebtables")
+		if err != nil{
+			glog.Errorf("Failed to look up ebtables: %v", err)
+		}
+		_, err = plugin.execer.Command(ebtablePath, "-F", "OUTPUT").CombinedOutput()
+		if err != nil{
+			glog.Errorf("Failed to flush ebtables OUTPUT chain: %v", err)
+		}
+		_, err = plugin.execer.Command(ebtablePath, "-A", "OUTPUT", "-p", "IPv4", "-s", macAddr, "-o", "veth+", "--ip-src", plugin.gateway, "-j", "ACCEPT").CombinedOutput()
+		if err != nil{
+			glog.Errorf("Failed to append ebtables rule: %v", err)
+		}
+		_, err = plugin.execer.Command(ebtablePath, "-A", "OUTPUT", "-p", "IPv4", "-s", macAddr, "-o", "veth+", "--ip-src", plugin.podcidr, "-j", "DROP").CombinedOutput()
+		if err != nil{
+			glog.Errorf("Failed to append ebtables rule: %v", err)
 		}
 	}
 
