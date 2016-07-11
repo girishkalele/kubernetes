@@ -22,10 +22,11 @@ import (
 	"os"
 
 	"fmt"
-	"github.com/spf13/pflag"
-	"k8s.io/kubernetes/pkg/util/validation"
 	_ "net/http/pprof"
 	"strings"
+
+	"github.com/spf13/pflag"
+	"k8s.io/kubernetes/pkg/util/validation"
 )
 
 type KubeDNSConfig struct {
@@ -36,16 +37,30 @@ type KubeDNSConfig struct {
 	DNSPort        int
 	// Federations maps federation names to their registered domain names.
 	Federations map[string]string
+
+	// DNS Replica Nanny parameters
+	NannyNamespace  string
+	NannyRCName     string
+	NannyThresholds string
+	// Number of seconds after process start before nanny can start adjustments
+	NannySlowStartTime int
+	// Number of seconds to wait between adjustments
+	NannyChangeInterval int
 }
 
 func NewKubeDNSConfig() *KubeDNSConfig {
 	return &KubeDNSConfig{
-		ClusterDomain:  "cluster.local.",
-		KubeConfigFile: "",
-		KubeMasterURL:  "",
-		HealthzPort:    8081,
-		DNSPort:        53,
-		Federations:    make(map[string]string),
+		ClusterDomain:       "cluster.local.",
+		KubeConfigFile:      "",
+		KubeMasterURL:       "",
+		HealthzPort:         8081,
+		DNSPort:             53,
+		Federations:         make(map[string]string),
+		NannyNamespace:      "kube-system",
+		NannyRCName:         "",
+		NannyThresholds:     "1,2,5,50,100,250,500,1000,1500,2000,2500,3000,3500,4000,4500,5000",
+		NannySlowStartTime:  300,
+		NannyChangeInterval: 60,
 	}
 }
 

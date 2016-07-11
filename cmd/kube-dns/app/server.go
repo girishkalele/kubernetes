@@ -104,6 +104,7 @@ func (server *KubeDNSServer) Run() {
 	setupSignalHandlers()
 	server.startSkyDNSServer()
 	server.kd.Start()
+
 	server.setupHealthzHandlers()
 	glog.Infof("Setting up Healthz Handler(/readiness, /cache) on port :%d", server.healthzPort)
 	glog.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", server.healthzPort), nil))
