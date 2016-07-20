@@ -21,57 +21,54 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/master/ports"
+	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/util/healthcheckparser"
 )
 
-const (
-	AddEndpointOp      = iota
-	DeleteEndpointOp   = iota
-	DeleteServiceOp    = iota
-	HealthCheckRequest = iota
-)
-
 var serviceEndpointsMap ServiceEndpointsMap
+var lock sync.Mutex
+var Healthchecker *ProxyHC
 
-func init() {
-	serviceEndpointsMap = make(map[string]ServiceEndpointsList)
-	// HACK HACK HACK - forcibly start listening on port 32023
-	// TODO - stitch this into the kube-proxy init sequence
-	ProxyHealthCheckFactory("", 32023)
+func Run() {
+	lock.Lock()
+	defer lock.Unlock()
+	serviceEndpointsMap = make(map[types.NamespacedName]ServiceEndpointsList)
+	Healthchecker = ProxyHealthCheckFactory("", ports.KubeProxyHealthCheckPort)
+}
+
+type ProxyMutationRequest struct {
+	ServiceName  types.NamespacedName
+	EndpointUids []string
 }
 
 type ProxyHealthCheckRequest struct {
-	Operation   int
-	ServiceUid  string
-	Namespace   string
-	ServiceName string
-	Endpoints   *api.Endpoints
-
+	ServiceName     types.NamespacedName
 	Result          bool
 	ResponseChannel *chan *ProxyHealthCheckRequest
-
-	/* Opaque data sent back to client */
-	rw  *http.ResponseWriter
-	req *http.Request
+	rw              *http.ResponseWriter
+	req             *http.Request
 }
 
 type ServiceEndpointsList struct {
-	endpoints map[string]*api.Endpoints
+	ServiceName types.NamespacedName
+	endpoints   map[string]bool
 }
 
-type ServiceEndpointsMap map[string]ServiceEndpointsList
+type ServiceEndpointsMap map[types.NamespacedName]ServiceEndpointsList
 
 type ProxyHealthChecker interface {
-	EnqueueRequest(req *ProxyHealthCheckRequest)
+	UpdateEndpoints(serviceName types.NamespacedName, endpointUid string, op int)
 }
 
 type ProxyHC struct {
-	requestChannel chan *ProxyHealthCheckRequest
-	hostIp         string
-	port           int16
+	mutationRequestChannel chan *ProxyMutationRequest
+	hcRequestChannel       chan *ProxyHealthCheckRequest
+	hostIp                 string
+	port                   int16
 
 	server http.Server
 	// net.Handler interface for responses
@@ -90,25 +87,24 @@ func sendHealthCheckResponse(rw *http.ResponseWriter, statusCode int, error stri
 }
 
 func parseHttpRequest(response *http.ResponseWriter, req *http.Request) (*ProxyHealthCheckRequest, chan *ProxyHealthCheckRequest, error) {
-	glog.Infof("Received Health Check on url %s", req.URL.String())
+	glog.V(3).Infof("Received Health Check on url %s", req.URL.String())
 	// Sanity check and parse the healthcheck URL
-	namespace, name, uid, err := healthcheckparser.ParseURL(req.URL.String())
+	namespace, name, err := healthcheckparser.ParseURL(req.URL.String())
 	if err != nil {
 		glog.Info("Parse failure - cannot respond to malformed healthcheck URL")
 		return nil, nil, err
 	}
 	// TODO - logging
-	glog.Infof("Parsed Healthcheck as service %s/%s (uid %s)", namespace, name, uid)
-	responseChannel := make(chan *ProxyHealthCheckRequest)
-	msg := &ProxyHealthCheckRequest{Operation: HealthCheckRequest,
+	glog.V(4).Infof("Parsed Healthcheck as service %s/%s", namespace, name)
+
+	serviceName := types.NamespacedName{namespace, name}
+	responseChannel := make(chan *ProxyHealthCheckRequest, 1)
+	msg := &ProxyHealthCheckRequest{
 		ResponseChannel: &responseChannel,
-		ServiceUid:      uid,
-		Namespace:       namespace,
-		ServiceName:     name,
+		ServiceName:     serviceName,
 		rw:              response,
 		req:             req,
 		Result:          false,
-		Endpoints:       nil,
 	}
 	return msg, responseChannel, nil
 }
@@ -117,46 +113,73 @@ func (handler ProxyHCHandler) ServeHTTP(response http.ResponseWriter, req *http.
 	// Grab the session guid from the URL and forward the request to the healtchecker
 	msg, responseChannel, err := parseHttpRequest(&response, req)
 	//TODO - logging
-	glog.Infof("Received HC request for service uid %s from LB control plane", msg.ServiceUid)
+	glog.V(2).Infof("HC Request Service %s from LB control plane", msg.ServiceName)
 	if err != nil {
-		//TODO - Return error HTTP code
 		sendHealthCheckResponse(&response, http.StatusBadRequest, fmt.Sprintf("Parse error: %s", err))
 	}
-	go handler.phc.EnqueueRequest(msg)
+	handler.phc.hcRequestChannel <- msg
 	<-responseChannel
 }
 
 // handleHealthCheckRequest - received a health check request - lookup and respond to HC.
 func (handler ProxyHC) handleHealthCheckRequest(req *ProxyHealthCheckRequest) {
 	defer func(r *ProxyHealthCheckRequest) { *(r.ResponseChannel) <- r }(req)
-	service, ok := serviceEndpointsMap[req.ServiceUid]
+	service, ok := serviceEndpointsMap[req.ServiceName]
 	if !ok {
+		// TODO - logging
+		glog.V(2).Infof("Service %s not found or has no local endpoints", req.ServiceName)
 		sendHealthCheckResponse(req.rw, http.StatusNotFound, "Service Endpoint Not Found")
 	} else {
-		sendHealthCheckResponse(req.rw, http.StatusOK, fmt.Sprintf("%d Service Endpoints found", len(service.endpoints)))
+		// todo - logging
+		glog.V(2).Infof("Service %s %d endpoints found", req.ServiceName.String(), len(service.endpoints))
+		if len(service.endpoints) > 0 {
+			sendHealthCheckResponse(req.rw, http.StatusOK, fmt.Sprintf("%d Service Endpoints found", len(service.endpoints)))
+		} else {
+			sendHealthCheckResponse(req.rw, http.StatusNotFound, "0 local Endpoints are alive")
+		}
 	}
 }
 
-// handleMutationRequest - received a request to mutate the table
-func (handler ProxyHC) handleMutationRequest(req *ProxyHealthCheckRequest) {
-	fmt.Println("Received table mutation request")
+// handleMutationRequest - received a request to mutate the table entry for a service
+func (handler ProxyHC) handleMutationRequest(req *ProxyMutationRequest) {
+	glog.V(2).Infof("Received table mutation request Service: %s - %d Endpoints %v",
+		req.ServiceName, len(req.EndpointUids), req.EndpointUids)
+	switch {
+	case len(req.EndpointUids) == 0:
+		delete(serviceEndpointsMap, req.ServiceName)
 
+	case len(req.EndpointUids) > 0:
+		entry, ok := serviceEndpointsMap[req.ServiceName]
+		if !ok {
+			glog.V(2).Infof("Creating new entry for %s", req.ServiceName.String())
+			serviceEndpointsMap[req.ServiceName] = ServiceEndpointsList{
+				ServiceName: req.ServiceName,
+				endpoints:   make(map[string]bool)}
+		} else {
+			entry.endpoints = make(map[string]bool)
+		}
+		entry, _ = serviceEndpointsMap[req.ServiceName]
+		for _, e := range req.EndpointUids {
+			glog.V(2).Infof("Adding endpoint %s to %s", e, req.ServiceName.String())
+			entry.endpoints[e] = true
+		}
+	}
 }
 
 func (handler ProxyHC) HandlerLoop() {
 	for {
+		// use separate channels for mutation vs health check servicing to minimize
+		// latency and jitter responding to health checks
 		select {
-		case req := <-handler.requestChannel:
-			//TODO - logging
-			fmt.Println("Dequeued request in health check loop ")
-			if req.Operation == HealthCheckRequest {
-				handler.handleHealthCheckRequest(req)
-			} else {
-				handler.handleMutationRequest(req)
-			}
+		case req := <-handler.hcRequestChannel:
+			//TODO - logging/stats
+			handler.handleHealthCheckRequest(req)
+		case req := <-handler.mutationRequestChannel:
+			//TODO - logging/stats
+			handler.handleMutationRequest(req)
 		case <-handler.shutdownChannel:
-			//TODO - logging
-			fmt.Println("Received shutdown request")
+			//TODO - logging/stats
+			fmt.Println("Received kube-proxy LB health check handler loop shutdown request")
 			break
 		}
 	}
@@ -169,10 +192,14 @@ func (handler ProxyHC) Shutdown() {
 }
 
 func ProxyHealthCheckFactory(ip string, port int16) *ProxyHC {
-	phc := &ProxyHC{requestChannel: make(chan *ProxyHealthCheckRequest),
-		hostIp:          ip,
-		port:            port,
-		shutdownChannel: make(chan bool)}
+
+	glog.V(2).Infof("Initializing kube-proxy health check on port %d", port)
+	phc := &ProxyHC{
+		mutationRequestChannel: make(chan *ProxyMutationRequest, 1024),
+		hcRequestChannel:       make(chan *ProxyHealthCheckRequest, 1024),
+		hostIp:                 ip,
+		port:                   port,
+		shutdownChannel:        make(chan bool)}
 
 	readyChan := make(chan bool)
 	go phc.StartListening(readyChan)
@@ -180,35 +207,36 @@ func ProxyHealthCheckFactory(ip string, port int16) *ProxyHC {
 	response := <-readyChan
 	if response != true {
 		//TODO
-		log.Fatalf("Failed to bind and listen on %s:%d\n", ip, port)
+		log.Printf("Failed to bind and listen on %s:%d\n", ip, port)
 		return nil
 	}
 	return phc
 }
 
-func (h *ProxyHC) EnqueueRequest(req *ProxyHealthCheckRequest) {
-	h.requestChannel <- req
+func (h *ProxyHC) UpdateEndpoints(serviceName types.NamespacedName, endpointUids []string) {
+	req := &ProxyMutationRequest{
+		ServiceName:  serviceName,
+		EndpointUids: endpointUids,
+	}
+	h.mutationRequestChannel <- req
 }
 
 func (h *ProxyHC) StartListening(readyChannel chan bool) {
-
 	h.proxyHandler = ProxyHCHandler{phc: h}
 	h.server = http.Server{Addr: fmt.Sprintf("%s:%d", h.hostIp, h.port), Handler: h.proxyHandler}
-
 	ln, err := net.Listen("tcp", h.server.Addr)
 	if err != nil {
 		// TODO
 		fmt.Printf("FAILED TO listen on address %s (%s)", h.server.Addr, err)
 		readyChannel <- false
 	}
-
 	readyChannel <- true
 	go h.HandlerLoop()
 	defer h.Shutdown()
 
 	err = h.server.Serve(ln)
 	if err != nil {
-		// TODO
+		// TODO loggings/stats
 		fmt.Printf("Proxy HealthCheck listen socket failure (%s)", err)
 		// TODO - what do we do here ?
 	}
