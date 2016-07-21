@@ -129,23 +129,25 @@ func (handler ProxyHC) handleHealthCheckRequest(req *ProxyHealthCheckRequest) {
 		// TODO - logging
 		glog.V(2).Infof("Service %s not found or has no local endpoints", req.ServiceName)
 		sendHealthCheckResponse(req.rw, http.StatusNotFound, "Service Endpoint Not Found")
-	} else {
-		// todo - logging
-		glog.V(2).Infof("Service %s %d endpoints found", req.ServiceName.String(), len(service.endpoints))
-		if len(service.endpoints) > 0 {
-			sendHealthCheckResponse(req.rw, http.StatusOK, fmt.Sprintf("%d Service Endpoints found", len(service.endpoints)))
-		} else {
-			sendHealthCheckResponse(req.rw, http.StatusNotFound, "0 local Endpoints are alive")
-		}
+		return
 	}
+	// todo - logging
+	glog.V(2).Infof("Service %s %d endpoints found", req.ServiceName.String(), len(service.endpoints))
+	if len(service.endpoints) > 0 {
+		sendHealthCheckResponse(req.rw, http.StatusOK, fmt.Sprintf("%d Service Endpoints found", len(service.endpoints)))
+		return
+	}
+
+	sendHealthCheckResponse(req.rw, http.StatusNotFound, "0 local Endpoints are alive")
 }
 
 // handleMutationRequest - received a request to mutate the table entry for a service
 func (handler ProxyHC) handleMutationRequest(req *ProxyMutationRequest) {
-	glog.V(2).Infof("Received table mutation request Service: %s - %d Endpoints %v",
+	glog.V(2).Infof("LB service health check mutation request Service: %s - %d Endpoints %v",
 		req.ServiceName, len(req.EndpointUids), req.EndpointUids)
 	switch {
 	case len(req.EndpointUids) == 0:
+		glog.V(2).Infof("Deleting entry for service %s", req.ServiceName.String())
 		delete(serviceEndpointsMap, req.ServiceName)
 
 	case len(req.EndpointUids) > 0:

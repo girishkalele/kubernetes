@@ -66,7 +66,7 @@ const kubeNodePortsChain utiliptables.Chain = "KUBE-NODEPORTS"
 const kubePostroutingChain utiliptables.Chain = "KUBE-POSTROUTING"
 
 // the kubernetes Load Balancer health check redirect chain
-const kubeLbHealthCheckRedirectChain utiliptables.Chain = "KUBE-LB-HEALTHCHECK-REDIRECT"
+const kubeLbHealthCheckRedirectChain utiliptables.Chain = "KUBE-HEALTHCHECK-REDIRECT"
 
 // the mark-for-masquerade chain
 // TODO: let kubelet manage this chain. Other component should just assume it exists and use it.
@@ -151,9 +151,10 @@ type serviceInfo struct {
 
 // internal struct for endpoints information
 type endpointsInfo struct {
-	ip      string
-	guid    types.UID
-	podGuid types.UID
+	ip            string
+	guid          types.UID
+	podGuid       types.UID
+	localEndpoint bool
 }
 
 // returns a new serviceInfo struct
@@ -278,15 +279,17 @@ func CleanupLeftovers(ipt utiliptables.Interface) (encounteredError bool) {
 		}
 	}
 
-	// Unlink the lb-healthcheck-redirect chain.
-	args = []string{
-		"-m", "comment", "--comment", "kubernetes load balancer health check redirect rules",
-		"-j", string(kubeLbHealthCheckRedirectChain),
-	}
-	if err := ipt.DeleteRule(utiliptables.TableNAT, utiliptables.ChainPostrouting, args...); err != nil {
-		if !utiliptables.IsNotFoundError(err) {
-			glog.Errorf("Error removing pure-iptables proxy rule: %v", err)
-			encounteredError = true
+	if false {
+		// Unlink the lb-healthcheck-redirect chain.
+		args = []string{
+			"-m", "comment", "--comment", "kubernetes load balancer health check redirect rules",
+			"-j", string(kubeLbHealthCheckRedirectChain),
+		}
+		if err := ipt.DeleteRule(utiliptables.TableNAT, utiliptables.ChainPostrouting, args...); err != nil {
+			if !utiliptables.IsNotFoundError(err) {
+				glog.Errorf("Error removing pure-iptables proxy rule: %v", err)
+				encounteredError = true
+			}
 		}
 	}
 
@@ -310,7 +313,7 @@ func CleanupLeftovers(ipt utiliptables.Interface) (encounteredError bool) {
 		// Hunt for service and endpoint chains.
 		for chain := range existingNATChains {
 			chainString := string(chain)
-			if strings.HasPrefix(chainString, "KUBE-SVC-") || strings.HasPrefix(chainString, "KUBE-SEP-") {
+			if strings.HasPrefix(chainString, "KUBE-SVC-") || strings.HasPrefix(chainString, "KUBE-SEP-") || strings.HasPrefix(chainString, "KUBE-LB-") {
 				writeLine(natChains, existingNATChains[chain]) // flush
 				writeLine(natRules, "-X", chainString)         // delete
 			}
@@ -510,7 +513,8 @@ func (proxier *Proxier) filterEndpoints(endPoints []hostPortInfo, endpointIPs []
 		key := net.JoinHostPort(hpp.host, strconv.Itoa(hpp.port))
 		_, ok := lookupMap[key]
 		if ok {
-			filteredEndpoints = append(filteredEndpoints, &endpointsInfo{ip: key, guid: hpp.epGuid, podGuid: hpp.podGuid})
+			filteredEndpoints = append(filteredEndpoints,
+				&endpointsInfo{ip: key, guid: hpp.epGuid, podGuid: hpp.podGuid, localEndpoint: hpp.localEndpoint})
 		}
 	}
 	return filteredEndpoints
@@ -821,7 +825,7 @@ func (proxier *Proxier) syncProxyRules() {
 	}
 
 	// Create and link the kube load balancer redirect chain.
-	{
+	if false {
 		if _, err := proxier.iptables.EnsureChain(utiliptables.TableNAT, kubeLbHealthCheckRedirectChain); err != nil {
 			glog.Errorf("Failed to ensure that %s chain %s exists: %v", utiliptables.TableNAT, kubeLbHealthCheckRedirectChain, err)
 			return
@@ -928,16 +932,14 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 		activeNATChains[svcChain] = true
 
+		svcLbChain := serviceLBChainName(svcName, protocol)
 		// Create the per-service LB chain, retaining counters if possible.
-		if svcInfo.onlyNodeLocalEndpoints {
-			svcLbChain := serviceLBChainName(svcName, protocol)
-			if lbChain, ok := existingNATChains[svcLbChain]; ok {
-				writeLine(natChains, lbChain)
-			} else {
-				writeLine(natChains, utiliptables.MakeChainLine(svcLbChain))
-			}
-			activeNATChains[svcLbChain] = true
+		if lbChain, ok := existingNATChains[svcLbChain]; ok {
+			writeLine(natChains, lbChain)
+		} else {
+			writeLine(natChains, utiliptables.MakeChainLine(svcLbChain))
 		}
+		activeNATChains[svcLbChain] = true
 
 		// Capture the clusterIP.
 		args := []string{
@@ -1020,10 +1022,11 @@ func (proxier *Proxier) syncProxyRules() {
 				// to masquerade.
 				if !svcInfo.onlyNodeLocalEndpoints {
 					writeLine(natRules, append(args, "-j", string(KubeMarkMasqChain))...)
+					writeLine(natRules, append(args, "-j", string(svcChain))...)
 				} else {
 					glog.V(3).Infof("Skipping LoadBalancer IP NAT rules for localized service %s (svc-guid: %s)", svcName.String(), svcInfo.guid)
+					writeLine(natRules, append(args, "-j", string(svcLbChain))...)
 				}
-				writeLine(natRules, append(args, "-j", string(svcChain))...)
 			}
 		}
 
@@ -1114,7 +1117,8 @@ func (proxier *Proxier) syncProxyRules() {
 			args := []string{
 				"-A", string(svcChain),
 				"-m", "comment", "--comment",
-				fmt.Sprintf(`"Balancing rule %d for %s (svc-guid: %s endpoint-guid: %s pod-guid: %s"`, i, svcName.String(), svcInfo.guid, endpoints[i].guid, endpoints[i].podGuid),
+				fmt.Sprintf(`"Balancing rule %d for %s (svc-guid: %s endpoint-guid: %s pod-guid: %s"`,
+					i, svcName.String(), svcInfo.guid, endpoints[i].guid, endpoints[i].podGuid),
 			}
 			if i < (n - 1) {
 				// Each rule is a probabilistic match.
@@ -1157,13 +1161,93 @@ func (proxier *Proxier) syncProxyRules() {
 			args = append(args, "-m", protocol, "-p", protocol, "-j", "DNAT", "--to-destination", endpoints[i].ip)
 			writeLine(natRules, args...)
 		}
+
+		if svcInfo.onlyNodeLocalEndpoints {
+			// Now write ingress loadbalancing & DNAT rules only for ESIPP preservation services.
+			// If the service did not have a local-service annotation, this svcLbChain is not needed.
+			localEndpoints := make([]*endpointsInfo, 0)
+			localEndpointChains := make([]utiliptables.Chain, 0)
+			for i, endpointChain := range endpointChains {
+				if endpoints[i].localEndpoint {
+					localEndpoints = append(localEndpoints, endpoints[i])
+					localEndpointChains = append(localEndpointChains, endpointChain)
+				}
+			}
+
+			n := len(localEndpointChains)
+			if n == 0 {
+				// Blackhole all LB traffic that should not be double-hopped.
+				// TODO - nat table does not allow DROP action - what is a suitable blackhole action ?
+				args := []string{
+					"-A", string(svcLbChain),
+					"-m", "comment", "--comment",
+					fmt.Sprintf(`"Blackhole rule for %s (svc-guid: %s) - No local endpoints"`, svcName.String(), svcInfo.guid),
+					"-j",
+					"LOG",
+				}
+				writeLine(natRules, args...)
+			} else {
+				// Setup probability filter rules only over local endpoints
+				for i, endpointChain := range localEndpointChains {
+					// Balancing rules in the per-service chain.
+					args := []string{
+						"-A", string(svcLbChain),
+						"-m", "comment", "--comment",
+						fmt.Sprintf(`"Balancing rule %d for %s (svc-guid: %s endpoint-guid: %s pod-guid: %s"`,
+							i, svcName.String(), svcInfo.guid, endpoints[i].guid, endpoints[i].podGuid),
+					}
+					if i < (n - 1) {
+						// Each rule is a probabilistic match.
+						args = append(args,
+							"-m", "statistic",
+							"--mode", "random",
+							"--probability", fmt.Sprintf("%0.5f", 1.0/float64(n-i)))
+					}
+					// The final (or only if n == 1) rule is a guaranteed match.
+					args = append(args, "-j", string(endpointChain))
+					writeLine(natRules, args...)
+
+					/* TODO - Girish - these rules below are not needed anymore in the external LB svc chain
+
+					// Rules in the per-endpoint chain.
+					args = []string{
+						"-A", string(endpointChain),
+						"-m", "comment", "--comment",
+						fmt.Sprintf(`"Hairpin case mark-for-SNAT for %s (svc-guid: %s) destined to %s (pod-guid: %s)"`,
+							svcName.String(), svcInfo.guid, endpoints[i].ip, endpoints[i].podGuid),
+					}
+					// Handle traffic that loops back to the originator with SNAT.
+					// Technically we only need to do this if the endpoint is on this
+					// host, but we don't have that information, so we just do this for
+					// all endpoints.
+					// TODO: if we grow logic to get this node's pod CIDR, we can use it.
+					writeLine(natRules, append(args,
+						"-s", fmt.Sprintf("%s/32", strings.Split(endpoints[i].ip, ":")[0]),
+						"-j", string(KubeMarkMasqChain))...)
+					*/
+					args = []string{
+						"-A", string(endpointChain),
+						"-m", "comment", "--comment",
+						fmt.Sprintf(`"Endpoint rule for %s (svc-guid: %s) destined to local pod %s (pod-guid: %s)"`,
+							svcName.String(), svcInfo.guid, endpoints[i].ip, endpoints[i].podGuid),
+					}
+					// Update client-affinity lists.
+					if svcInfo.sessionAffinityType == api.ServiceAffinityClientIP {
+						args = append(args, "-m", "recent", "--name", string(endpointChain), "--set")
+					}
+					// DNAT to final destination.
+					args = append(args, "-m", protocol, "-p", protocol, "-j", "DNAT", "--to-destination", endpoints[i].ip)
+					writeLine(natRules, args...)
+				}
+			}
+		}
 	}
 
 	// Delete chains no longer in use.
 	for chain := range existingNATChains {
 		if !activeNATChains[chain] {
 			chainString := string(chain)
-			if !strings.HasPrefix(chainString, "KUBE-SVC-") && !strings.HasPrefix(chainString, "KUBE-SEP-") {
+			if !strings.HasPrefix(chainString, "KUBE-SVC-") && !strings.HasPrefix(chainString, "KUBE-SEP-") && !strings.HasPrefix(chainString, "KUBE-LB-") {
 				// Ignore chains that aren't ours.
 				continue
 			}
@@ -1197,6 +1281,9 @@ func (proxier *Proxier) syncProxyRules() {
 	err = proxier.iptables.RestoreAll(lines, utiliptables.NoFlushTables, utiliptables.RestoreCounters)
 	if err != nil {
 		glog.Errorf("Failed to execute iptables-restore: %v", err)
+		for n, l := range strings.Split(string(lines), "\n") {
+			glog.Errorf("%d. %s", n, l)
+		}
 		// Revert new local ports.
 		revertPorts(replacementPortsMap, proxier.portsMap)
 		return
