@@ -78,7 +78,7 @@ const oldIptablesMasqueradeMark = "0x4d415351"
 
 // An annotation that denotes if this Service desires to only route to local
 // endpoints. Typically used to preserve source IP in loadbalanced Services.
-const onlyNodeLocalEndpointsAnnotation = "service.alpha.kubernetes.io/only-node-local-endpoints"
+const onlyNodeLocalEndpointsAnnotation = "service.alpha.kubernetes.io/cloud-lb-only-node-local-endpoints"
 
 // IptablesVersioner can query the current iptables version.
 type IptablesVersioner interface {
@@ -933,13 +933,16 @@ func (proxier *Proxier) syncProxyRules() {
 		activeNATChains[svcChain] = true
 
 		svcLbChain := serviceLBChainName(svcName, protocol)
-		// Create the per-service LB chain, retaining counters if possible.
-		if lbChain, ok := existingNATChains[svcLbChain]; ok {
-			writeLine(natChains, lbChain)
-		} else {
-			writeLine(natChains, utiliptables.MakeChainLine(svcLbChain))
+		if svcInfo.onlyNodeLocalEndpoints {
+			// Create the per-service LB chain, retaining counters if possible.
+			// only for ESIPP annotation services
+			if lbChain, ok := existingNATChains[svcLbChain]; ok {
+				writeLine(natChains, lbChain)
+			} else {
+				writeLine(natChains, utiliptables.MakeChainLine(svcLbChain))
+			}
+			activeNATChains[svcLbChain] = true
 		}
-		activeNATChains[svcLbChain] = true
 
 		// Capture the clusterIP.
 		args := []string{
@@ -1139,14 +1142,15 @@ func (proxier *Proxier) syncProxyRules() {
 					svcName.String(), svcInfo.guid, endpoints[i].ip, endpoints[i].podGuid),
 			}
 			// Handle traffic that loops back to the originator with SNAT.
-			// Technically we only need to do this if the endpoint is on this
-			// host, but we don't have that information, so we just do this for
-			// all endpoints.
-			// TODO: if we grow logic to get this node's pod CIDR, we can use it.
-			writeLine(natRules, append(args,
-				"-s", fmt.Sprintf("%s/32", strings.Split(endpoints[i].ip, ":")[0]),
-				"-j", string(KubeMarkMasqChain))...)
-
+			// We only need to do this if the endpoint is on this node.
+			if endpoints[i].localEndpoint {
+				writeLine(natRules, append(args,
+					"-s", fmt.Sprintf("%s/32", strings.Split(endpoints[i].ip, ":")[0]),
+					"-j", string(KubeMarkMasqChain))...)
+			} else {
+				glog.V(3).Infof("Skipping SNAT hairpin rule for non-local endpoint %s for service %s",
+					endpoints[i].ip, svcName.String())
+			}
 			args = []string{
 				"-A", string(endpointChain),
 				"-m", "comment", "--comment",
@@ -1162,85 +1166,69 @@ func (proxier *Proxier) syncProxyRules() {
 			writeLine(natRules, args...)
 		}
 
-		if svcInfo.onlyNodeLocalEndpoints {
-			// Now write ingress loadbalancing & DNAT rules only for ESIPP preservation services.
-			// If the service did not have a local-service annotation, this svcLbChain is not needed.
-			localEndpoints := make([]*endpointsInfo, 0)
-			localEndpointChains := make([]utiliptables.Chain, 0)
-			for i, endpointChain := range endpointChains {
-				if endpoints[i].localEndpoint {
-					localEndpoints = append(localEndpoints, endpoints[i])
-					localEndpointChains = append(localEndpointChains, endpointChain)
-				}
+		if !svcInfo.onlyNodeLocalEndpoints {
+			continue
+		}
+		// Now write ingress loadbalancing & DNAT rules only for ESIPP preservation services.
+		// If the service did not have a local-service annotation, this svcLbChain is not needed.
+		localEndpoints := make([]*endpointsInfo, 0)
+		localEndpointChains := make([]utiliptables.Chain, 0)
+		for i, endpointChain := range endpointChains {
+			if endpoints[i].localEndpoint {
+				localEndpoints = append(localEndpoints, endpoints[i])
+				localEndpointChains = append(localEndpointChains, endpointChain)
 			}
+		}
 
-			n := len(localEndpointChains)
-			if n == 0 {
-				// Blackhole all LB traffic that should not be double-hopped.
-				// TODO - nat table does not allow DROP action - what is a suitable blackhole action ?
+		n = len(localEndpointChains)
+		if n == 0 {
+			// Blackhole all LB traffic that should not be double-hopped.
+			// TODO - nat table does not allow DROP action - what is a suitable blackhole action ?
+			args := []string{
+				"-A", string(svcLbChain),
+				"-m", "comment", "--comment",
+				fmt.Sprintf(`"Blackhole rule for %s (svc-guid: %s) - No local endpoints"`, svcName.String(), svcInfo.guid),
+				"-j",
+				"LOG",
+			}
+			writeLine(natRules, args...)
+		} else {
+			// Setup probability filter rules only over local endpoints
+			for i, endpointChain := range localEndpointChains {
+				// Balancing rules in the per-service chain.
 				args := []string{
 					"-A", string(svcLbChain),
 					"-m", "comment", "--comment",
-					fmt.Sprintf(`"Blackhole rule for %s (svc-guid: %s) - No local endpoints"`, svcName.String(), svcInfo.guid),
-					"-j",
-					"LOG",
+					fmt.Sprintf(`"Balancing rule %d for %s (svc-guid: %s endpoint-guid: %s pod-guid: %s"`,
+						i, svcName.String(), svcInfo.guid, endpoints[i].guid, endpoints[i].podGuid),
 				}
+				if i < (n - 1) {
+					// Each rule is a probabilistic match.
+					args = append(args,
+						"-m", "statistic",
+						"--mode", "random",
+						"--probability", fmt.Sprintf("%0.5f", 1.0/float64(n-i)))
+				}
+				// The final (or only if n == 1) rule is a guaranteed match.
+				args = append(args, "-j", string(endpointChain))
 				writeLine(natRules, args...)
-			} else {
-				// Setup probability filter rules only over local endpoints
-				for i, endpointChain := range localEndpointChains {
-					// Balancing rules in the per-service chain.
-					args := []string{
-						"-A", string(svcLbChain),
-						"-m", "comment", "--comment",
-						fmt.Sprintf(`"Balancing rule %d for %s (svc-guid: %s endpoint-guid: %s pod-guid: %s"`,
-							i, svcName.String(), svcInfo.guid, endpoints[i].guid, endpoints[i].podGuid),
-					}
-					if i < (n - 1) {
-						// Each rule is a probabilistic match.
-						args = append(args,
-							"-m", "statistic",
-							"--mode", "random",
-							"--probability", fmt.Sprintf("%0.5f", 1.0/float64(n-i)))
-					}
-					// The final (or only if n == 1) rule is a guaranteed match.
-					args = append(args, "-j", string(endpointChain))
-					writeLine(natRules, args...)
 
-					/* TODO - Girish - these rules below are not needed anymore in the external LB svc chain
-
-					// Rules in the per-endpoint chain.
-					args = []string{
-						"-A", string(endpointChain),
-						"-m", "comment", "--comment",
-						fmt.Sprintf(`"Hairpin case mark-for-SNAT for %s (svc-guid: %s) destined to %s (pod-guid: %s)"`,
-							svcName.String(), svcInfo.guid, endpoints[i].ip, endpoints[i].podGuid),
-					}
-					// Handle traffic that loops back to the originator with SNAT.
-					// Technically we only need to do this if the endpoint is on this
-					// host, but we don't have that information, so we just do this for
-					// all endpoints.
-					// TODO: if we grow logic to get this node's pod CIDR, we can use it.
-					writeLine(natRules, append(args,
-						"-s", fmt.Sprintf("%s/32", strings.Split(endpoints[i].ip, ":")[0]),
-						"-j", string(KubeMarkMasqChain))...)
-					*/
-					args = []string{
-						"-A", string(endpointChain),
-						"-m", "comment", "--comment",
-						fmt.Sprintf(`"Endpoint rule for %s (svc-guid: %s) destined to local pod %s (pod-guid: %s)"`,
-							svcName.String(), svcInfo.guid, endpoints[i].ip, endpoints[i].podGuid),
-					}
-					// Update client-affinity lists.
-					if svcInfo.sessionAffinityType == api.ServiceAffinityClientIP {
-						args = append(args, "-m", "recent", "--name", string(endpointChain), "--set")
-					}
-					// DNAT to final destination.
-					args = append(args, "-m", protocol, "-p", protocol, "-j", "DNAT", "--to-destination", endpoints[i].ip)
-					writeLine(natRules, args...)
+				args = []string{
+					"-A", string(endpointChain),
+					"-m", "comment", "--comment",
+					fmt.Sprintf(`"Endpoint rule for %s (svc-guid: %s) destined to local pod %s (pod-guid: %s)"`,
+						svcName.String(), svcInfo.guid, endpoints[i].ip, endpoints[i].podGuid),
 				}
+				// Update client-affinity lists.
+				if svcInfo.sessionAffinityType == api.ServiceAffinityClientIP {
+					args = append(args, "-m", "recent", "--name", string(endpointChain), "--set")
+				}
+				// DNAT to final destination.
+				args = append(args, "-m", protocol, "-p", protocol, "-j", "DNAT", "--to-destination", endpoints[i].ip)
+				writeLine(natRules, args...)
 			}
 		}
+
 	}
 
 	// Delete chains no longer in use.

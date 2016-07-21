@@ -76,7 +76,7 @@ const (
 
 	// An annotation that denotes if this Service desires to only route to local
 	// endpoints. Typically used to preserve source IP in loadbalanced Services.
-	onlyNodeLocalEndpointsAnnotation = "service.alpha.kubernetes.io/only-node-local-endpoints"
+	onlyNodeLocalEndpointsAnnotation = "service.alpha.kubernetes.io/cloud-lb-only-node-local-endpoints"
 
 	// Path used for http health check of services with the
 	// onlyNodeLocalEndpointsAnnotation annotation set. The same path applies to
