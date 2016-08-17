@@ -442,8 +442,8 @@ func (proxier *Proxier) OnServiceUpdate(allServices []api.Service) {
 			info.sessionAffinityType = service.Spec.SessionAffinity
 			info.onlyNodeLocalEndpoints = apiservice.ServiceNeedsHealthCheck(service)
 			if info.onlyNodeLocalEndpoints {
-				p, err := apiservice.GetServiceHealthCheckNodePort(service)
-				if err != nil {
+				p := apiservice.GetServiceHealthCheckNodePort(service)
+				if p == 0 {
 					glog.Errorf("Service does not contain necessary annotation %v",
 						apiservice.AnnotationHealthCheckNodePort)
 				} else {
@@ -1029,6 +1029,7 @@ func (proxier *Proxier) syncProxyRules() {
 
 		// Generate the per-endpoint chains.  We do this in multiple passes so we
 		// can group rules together.
+		// These two slices parallel each other - keep in sync
 		endpoints := make([]*endpointsInfo, 0)
 		endpointChains := make([]utiliptables.Chain, 0)
 		for _, ep := range proxier.endpointsMap[svcName] {
@@ -1105,6 +1106,7 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 
 		// Now write ingress loadbalancing & DNAT rules only for services that have a localOnly annotation
+		// TODO - This logic may be combinable with the block above.
 		localEndpoints := make([]*endpointsInfo, 0)
 		localEndpointChains := make([]utiliptables.Chain, 0)
 		for i := range endpointChains {
