@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/skynetservices/skydns/cache"
 	"github.com/skynetservices/skydns/metrics"
 	"github.com/skynetservices/skydns/msg"
@@ -24,6 +25,37 @@ import (
 
 const Version = "2.5.3a"
 
+type skydnsCounters struct {
+	forwardedCounter prometheus.Counter
+	forwardFailure   prometheus.Counter
+	forwardsInFlight prometheus.Gauge
+}
+
+func NewCounterBlock() skydnsCounters {
+	forwardedCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "skynetservices",
+		Subsystem: "skydns",
+		Name:      "forwarded",
+		Help:      "Number of DNS lookups forwarded to upstream server",
+	})
+	forwardFailure := prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "skynetservices",
+		Subsystem: "skydns",
+		Name:      "forward_failures",
+		Help:      "Number of DNS lookups that failed when forwarded to upstream server",
+	})
+	forwardsInFlight := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "skynetservices",
+		Subsystem: "skydns",
+		Name:      "forwarded_queries_inflight",
+		Help:      "Number of DNS lookups that are forwarded in-flight upstream",
+	})
+	prometheus.MustRegister(forwardedCounter)
+	prometheus.MustRegister(forwardFailure)
+	prometheus.MustRegister(forwardsInFlight)
+	return skydnsCounters{forwardedCounter: forwardedCounter}
+}
+
 type server struct {
 	backend Backend
 	config  *Config
@@ -33,6 +65,8 @@ type server struct {
 	dnsTCPclient *dns.Client // used for forwarding queries
 	scache       *cache.Cache
 	rcache       *cache.Cache
+
+	Counters skydnsCounters
 }
 
 // New returns a new SkyDNS server.
@@ -46,6 +80,7 @@ func New(backend Backend, config *Config) *server {
 		rcache:       cache.New(config.RCache, config.RCacheTtl),
 		dnsUDPclient: &dns.Client{Net: "udp", ReadTimeout: config.ReadTimeout, WriteTimeout: config.ReadTimeout, SingleInflight: true},
 		dnsTCPclient: &dns.Client{Net: "tcp", ReadTimeout: config.ReadTimeout, WriteTimeout: config.ReadTimeout, SingleInflight: true},
+		Counters:     NewCounterBlock(),
 	}
 }
 
@@ -200,7 +235,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	for zone, ns := range *s.config.stub {
-		if strings.HasSuffix(name, "." + zone) || name == zone {
+		if strings.HasSuffix(name, "."+zone) || name == zone {
 			metrics.ReportRequestCount(req, metrics.Stub)
 
 			resp := s.ServeDNSStubForward(w, req, ns)
@@ -232,7 +267,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	if q.Qclass != dns.ClassCHAOS && !strings.HasSuffix(name, "." +s.config.Domain) && name != s.config.Domain {
+	if q.Qclass != dns.ClassCHAOS && !strings.HasSuffix(name, "."+s.config.Domain) && name != s.config.Domain {
 		metrics.ReportRequestCount(req, metrics.Rec)
 
 		resp := s.ServeDNSForward(w, req)

@@ -115,7 +115,7 @@ users:
     client-certificate: {{ .Cert }}
     client-key: {{ .Key }}
 `,
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			msg: "multiple clusters with no context",
@@ -135,7 +135,7 @@ users:
     client-certificate: {{ .Cert }}
     client-key: {{ .Key }}
 `,
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			msg: "multiple clusters with a context",

@@ -24,6 +24,7 @@ import (
 	"syscall"
 
 	"github.com/golang/glog"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/skynetservices/skydns/metrics"
 	"github.com/skynetservices/skydns/server"
 	"github.com/spf13/pflag"
@@ -104,6 +105,7 @@ func (server *KubeDNSServer) Run() {
 	server.startSkyDNSServer()
 	server.kd.Start()
 	server.setupHealthzHandlers()
+	server.setupPrometheusHandlers()
 	glog.Infof("Setting up Healthz Handler(/readiness, /cache) on port :%d", server.healthzPort)
 	glog.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", server.healthzPort), nil))
 }
@@ -122,6 +124,10 @@ func (server *KubeDNSServer) setupHealthzHandlers() {
 			fmt.Fprint(w, err)
 		}
 	})
+}
+
+func (server *KubeDNSServer) setupPrometheusHandlers() {
+	http.Handle("/metrics", prometheus.Handler())
 }
 
 // setupSignalHandlers runs a goroutine that waits on SIGINT or SIGTERM and logs it

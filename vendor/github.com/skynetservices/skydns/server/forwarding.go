@@ -12,6 +12,8 @@ import (
 
 // ServeDNSForward forwards a request to a nameservers and returns the response.
 func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
+
+	s.Counters.forwardedCounter.Inc()
 	if s.config.NoRec {
 		m := s.ServerFailure(req)
 		w.WriteMsg(m)
@@ -40,11 +42,13 @@ func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
 	nsid := s.randomNameserverID(req.Id)
 	try := 0
 Redo:
+	s.Counters.forwardsInFlight.Inc()
 	if isTCP(w) {
 		r, err = exchangeWithRetry(s.dnsTCPclient, req, s.config.Nameservers[nsid])
 	} else {
 		r, err = exchangeWithRetry(s.dnsUDPclient, req, s.config.Nameservers[nsid])
 	}
+	s.Counters.forwardsInFlight.Dec()
 	if err == nil {
 		r.Compress = true
 		r.Id = req.Id
@@ -60,6 +64,7 @@ Redo:
 	}
 
 	logf("failure to forward request %q", err)
+	s.Counters.forwardFailure.Inc()
 	m := s.ServerFailure(req)
 	return m
 }

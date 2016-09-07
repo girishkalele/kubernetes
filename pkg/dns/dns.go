@@ -27,6 +27,7 @@ import (
 
 	etcd "github.com/coreos/etcd/client"
 	"github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus"
 	skymsg "github.com/skynetservices/skydns/msg"
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/endpoints"
@@ -125,6 +126,10 @@ type KubeDNS struct {
 	// cluster zone annotation from the cached node instead of getting it from the API server
 	// every time.
 	nodesStore kcache.Store
+
+	inflight          prometheus.Gauge
+	queries           prometheus.Counter
+	federationQueries prometheus.Counter
 }
 
 func NewKubeDNS(client clientset.Interface, domain string, federations map[string]string) (*KubeDNS, error) {
@@ -145,9 +150,29 @@ func NewKubeDNS(client clientset.Interface, domain string, federations map[strin
 		clusterIPServiceMap: make(map[string]*kapi.Service),
 		domainPath:          reverseArray(strings.Split(strings.TrimRight(domain, "."), ".")),
 		federations:         federations,
+		inflight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "kube_system",
+			Subsystem: "kube_dns",
+			Name:      "in_flight",
+			Help:      "Number of DNS lookups in-flight",
+		}),
+		queries: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "kube_system",
+			Subsystem: "kube_dns",
+			Name:      "queries",
+			Help:      "Number of DNS lookups",
+		}),
+		federationQueries: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "kube_system",
+			Subsystem: "kube_dns",
+			Name:      "federation_queries",
+			Help:      "Number of Federation DNS lookups",
+		}),
 	}
 	kd.setEndpointsStore()
 	kd.setServicesStore()
+	prometheus.MustRegister(kd.inflight)
+	prometheus.MustRegister(kd.queries)
 	return kd, nil
 }
 
@@ -469,12 +494,16 @@ func (kd *KubeDNS) newExternalNameService(service *kapi.Service) {
 // matching the given name is returned, otherwise all records stored under
 // the subtree matching the name are returned.
 func (kd *KubeDNS) Records(name string, exact bool) (retval []skymsg.Service, err error) {
+	kd.queries.Inc()
+	kd.inflight.Inc()
+	defer kd.inflight.Dec()
 	glog.V(2).Infof("Received DNS Request:%s, exact:%v", name, exact)
 	trimmed := strings.TrimRight(name, ".")
 	segments := strings.Split(trimmed, ".")
 	isFederationQuery := false
 	federationSegments := []string{}
 	if !exact && kd.isFederationQuery(segments) {
+		kd.federationQueries.Inc()
 		glog.V(2).Infof("federation service query: Received federation query. Going to try to find local service first")
 		// Try quering the non-federation (local) service first.
 		// Will try the federation one later, if this fails.
