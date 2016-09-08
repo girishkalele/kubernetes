@@ -217,7 +217,7 @@ var _ = framework.KubeDescribe("Kubelet [Serial] [Slow]", func() {
 		result := om.GetLatestRuntimeOperationErrorRate()
 		framework.Logf("runtime operation error metrics:\n%s", framework.FormatRuntimeOperationErrorRate(result))
 	})
-	framework.KubeDescribe("regular resource usage tracking", func() {
+	framework.KubeDescribe("[Flaky] regular resource usage tracking", func() {
 		// We assume that the scheduler will make reasonable scheduling choices
 		// and assign ~N pods on the node.
 		// Although we want to track N pods per node, there are N + add-on pods
